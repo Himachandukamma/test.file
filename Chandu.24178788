@@ -1,0 +1,184 @@
+# ---------------------- FULL GA-BASED FEATURE SELECTION PIPELINE ----------------------
+
+# Load required libraries
+library(data.table)
+library(dplyr)
+library(caret)
+library(GA)
+library(ranger)
+library(ggplot2)
+
+# STEP 1: Load and Subset 100,000 Rows
+data <- fread("C:/Users/sahithi/Downloads/Dataset_Unicauca_Version2_87Atts.csv")
+data <- data[complete.cases(data), ]
+data <- as.data.frame(data)
+data$L7Protocol <- as.factor(data$L7Protocol)
+set.seed(42)
+data <- data[sample(nrow(data), 100000), ]
+
+# STEP 2: Drop Non-Feature Columns
+drop_cols <- c("Flow.ID", "Source.IP", "Destination.IP", "Timestamp", 
+               "Source.Port", "Destination.Port", "Protocol", "Label", "ProtocolName")
+data <- data[, !(names(data) %in% drop_cols)]
+
+# STEP 3: Normalize Numeric Features
+preproc <- preProcess(data[, -ncol(data)], method = c("center", "scale"))
+data_scaled <- predict(preproc, data[, -ncol(data)])
+data_scaled$L7Protocol <- droplevels(data$L7Protocol)
+
+# STEP 4: Train-Test Split
+set.seed(123)
+train_idx <- createDataPartition(data_scaled$L7Protocol, p = 0.7, list = FALSE)
+train <- data_scaled[train_idx, ]
+test <- data_scaled[-train_idx, ]
+x_train <- train[, -ncol(train)]
+y_train <- train$L7Protocol
+x_test <- test[, -ncol(test)]
+y_test <- droplevels(test$L7Protocol)
+num_features <- ncol(x_train)
+
+# STEP 5: Custom Macro F1 Score Function
+macro_f1 <- function(true, predicted) {
+  levels_all <- union(levels(true), levels(predicted))
+  true <- factor(true, levels = levels_all)
+  predicted <- factor(predicted, levels = levels_all)
+  cm <- caret::confusionMatrix(predicted, true)
+  by_class <- cm$byClass
+  if (is.null(nrow(by_class))) {
+    f1 <- 2 * (by_class["Sensitivity"] * by_class["Precision"]) /
+      (by_class["Sensitivity"] + by_class["Precision"])
+    return(f1)
+  } else {
+    f1_per_class <- 2 * (by_class[, "Sensitivity"] * by_class[, "Precision"]) /
+      (by_class[, "Sensitivity"] + by_class[, "Precision"])
+    f1_per_class[is.na(f1_per_class)] <- 0
+    return(mean(f1_per_class))
+  }
+}
+
+# STEP 6: Fitness Function
+fitness_func <- function(bits, datax, datay) {
+  if (sum(bits) == 0) return(0)
+  sel <- which(bits == 1)
+  model <- ranger(L7Protocol ~ ., data = data.frame(L7Protocol = datay, datax[, sel, drop=FALSE]), 
+                  num.trees = 25, probability = TRUE, num.threads = 2)
+  preds <- predict(model, data = x_test[, sel, drop=FALSE])$predictions
+  pred_labels <- factor(colnames(preds)[apply(preds, 1, which.max)], levels = levels(y_test))
+  macro_f1(y_test, pred_labels)
+}
+
+# STEP 7: Genetic Algorithm for Feature Selection
+set.seed(999)
+ga_result <- ga(type = "binary",
+                fitness = function(chrom) fitness_func(chrom, x_train, y_train),
+                nBits = num_features,
+                popSize = 15,
+                maxiter = 15,
+                pmutation = 0.1,
+                pcrossover = 0.8,
+                run = 5)
+
+# STEP 8: Final Evaluation
+selected_feats <- which(ga_result@solution[1, ] == 1)
+final_model <- ranger(L7Protocol ~ ., data = data.frame(L7Protocol = y_train, x_train[, selected_feats]),
+                      num.trees = 50, probability = TRUE)
+final_preds <- predict(final_model, data = x_test[, selected_feats])$predictions
+final_labels <- factor(colnames(final_preds)[apply(final_preds, 1, which.max)], levels = levels(y_test))
+final_f1 <- macro_f1(y_test, final_labels)
+
+# STEP 9: Output Summary
+cat("✔️  Final Macro F1 Score:", round(final_f1, 4), "\n")
+cat("✔️  Features Selected:", length(selected_feats), "/", num_features, "\n")
+
+# ---------------------- PLOTS ----------------------
+
+# Plot 1: GA Convergence Curve
+plot(ga_result@summary[, "mean"], type = "l", col = "blue", lwd = 2,
+     main = "GA Convergence Curve", xlab = "Generation", ylab = "Mean F1 Score")
+
+# Plot 2: Top 15 Most Selected Features in GA Population
+if (!is.null(ga_result@population)) {
+  feature_freq <- colSums(ga_result@population)
+  top_features <- sort(feature_freq, decreasing = TRUE)[1:15]
+  barplot(top_features, col = "steelblue",
+          main = "Top 15 Frequently Selected Features by GA",
+          ylab = "Selection Frequency", las = 2)
+}
+
+# Plot 3: Distribution of Feature Counts per GA Individual
+if (!is.null(ga_result@population)) {
+  feature_counts <- rowSums(ga_result@population)
+  hist(feature_counts, breaks = 10, col = "darkgreen",
+       main = "Distribution of Feature Count in GA Solutions",
+       xlab = "Number of Features", ylab = "Frequency")
+}
+
+# Plot 4: Summary Bar Chart (F1 and Count)
+barplot(c(final_f1, length(selected_feats)), 
+        names.arg = c("Macro F1 Score", "Features Selected"), 
+        col = c("purple", "orange"), main = "GA Optimisation Summary")
+
+
+# ---------------------- STEP 10: PARTICLE SWARM OPTIMISATION ----------------------
+library(pso)
+
+pso_wrapper <- function(par) -fitness_func(round(par), x_train, y_train)
+
+set.seed(888)
+pso_result <- psoptim(rep(0, num_features),
+                      fn = pso_wrapper,
+                      lower = rep(0, num_features),
+                      upper = rep(1, num_features),
+                      control = list(maxit = 15))
+
+pso_features <- which(round(pso_result$par) == 1)
+model_pso <- ranger(L7Protocol ~ ., data = data.frame(L7Protocol = y_train, x_train[, pso_features]),
+                    num.trees = 50, probability = TRUE)
+preds_pso <- predict(model_pso, data = x_test[, pso_features])$predictions
+labels_pso <- factor(colnames(preds_pso)[apply(preds_pso, 1, which.max)], levels = levels(y_test))
+f1_pso <- macro_f1(y_test, labels_pso)
+
+
+# ---------------------- STEP 11: SIMULATED ANNEALING ----------------------
+library(GenSA)
+
+sa_wrapper <- function(par) -fitness_func(round(par), x_train, y_train)
+
+set.seed(777)
+sa_result <- GenSA(par = rep(0, num_features),
+                   fn = sa_wrapper,
+                   lower = rep(0, num_features),
+                   upper = rep(1, num_features),
+                   control = list(max.call = 150))
+
+sa_features <- which(round(sa_result$par) == 1)
+model_sa <- ranger(L7Protocol ~ ., data = data.frame(L7Protocol = y_train, x_train[, sa_features]),
+                   num.trees = 50, probability = TRUE)
+preds_sa <- predict(model_sa, data = x_test[, sa_features])$predictions
+labels_sa <- factor(colnames(preds_sa)[apply(preds_sa, 1, which.max)], levels = levels(y_test))
+f1_sa <- macro_f1(y_test, labels_sa)
+
+
+# ---------------------- STEP 12: FINAL COMPARISON PLOTS ----------------------
+
+# F1 Score Comparison
+f1_scores <- c(GA = final_f1, PSO = f1_pso, SA = f1_sa)
+barplot(f1_scores,
+        col = c("steelblue", "darkgreen", "tomato"),
+        ylim = c(0, 1),
+        main = "Macro F1 Score by Optimisation Method",
+        ylab = "Macro F1 Score")
+
+# Feature Count Comparison
+feature_counts <- c(GA = length(selected_feats), PSO = length(pso_features), SA = length(sa_features))
+barplot(feature_counts,
+        col = c("steelblue", "darkgreen", "tomato"),
+        main = "Number of Features Selected",
+        ylab = "Feature Count")
+
+# ---------------------- STEP 13: SUMMARY OUTPUT ----------------------
+cat("\n--- FINAL RESULTS ---\n")
+cat("GA:   Macro F1 =", round(final_f1, 4), " | Features:", length(selected_feats), "\n")
+cat("PSO:  Macro F1 =", round(f1_pso, 4), " | Features:", length(pso_features), "\n")
+cat("SA:   Macro F1 =", round(f1_sa, 4), " | Features:", length(sa_features), "\n")
+
